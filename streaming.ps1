@@ -1,11 +1,23 @@
 $rules = Get-Content .\rules.json -Raw -Encoding utf8 | ConvertFrom-Json
 $prompt = $rules.llm.prompt
 
-$containerHash = ($rules.container | ConvertTo-Json -Compress).GetHashCode().ToString()
+# Вычисляем -np: серверу нужно минимум n слотов
+$npValue = [int]$rules.llm.n
+
+# Хеш для отслеживания изменений конфигурации контейнера
+$containerConfig = @{
+    cpus = $rules.container.cpus
+    threads = $rules.container.threads
+    threads_batch = $rules.container.threads_batch
+    ctx_size = $rules.container.ctx_size
+    batch_size = $rules.container.batch_size
+    np = $npValue
+} | ConvertTo-Json -Compress
+
+$containerHash = $containerConfig.GetHashCode().ToString()
 $storedHash = if (Test-Path .\.container-hash) { Get-Content .\.container-hash -Raw } else { "" }
 
 if ($containerHash -ne $storedHash) {
-    Write-Host "Container settings changed, restarting..." -ForegroundColor Yellow
     docker stop llama-mistral 2>$null
     docker rm llama-mistral 2>$null
     $containerHash | Out-File -FilePath .\.container-hash -NoNewline
@@ -27,15 +39,14 @@ if (-not $running) {
         --threads-batch $($rules.container.threads_batch) `
         --ctx-size $($rules.container.ctx_size) `
         --batch-size $($rules.container.batch_size) `
-        -np $($rules.container.n_parallel) `
+        -np $npValue `
         --mlock `
         --no-mmap
 }
 
 # Ждём готовности сервера с анимацией
 Write-Host "Waiting for server" -NoNewline -ForegroundColor Yellow
-$wait = 2
-$maxWait = 60
+$maxWait = 120
 $elapsed = 0
 $spinner = @('|', '/', '-', '\')
 $spinnerIndex = 0
@@ -44,7 +55,7 @@ while ($elapsed -lt $maxWait) {
     try {
         $test = Invoke-RestMethod -Uri http://127.0.0.1:8080/health -Method Get -TimeoutSec 2
         if ($test.status -eq "ok") {
-            Write-Host "`rServer is ready!                    " -ForegroundColor Green
+            Write-Host "`rServer is ready! (np=$npValue, n=$($rules.llm.n))                    " -ForegroundColor Green
             break
         }
     } catch {}
@@ -71,6 +82,9 @@ foreach ($prop in $rules.llm.PSObject.Properties) {
     }
 }
 
+# stream всегда true
+$body["stream"] = $true
+
 $bodyJson = $body | ConvertTo-Json -Depth 3 -Compress
 
 Write-Host "`nStreaming response:`n" -ForegroundColor Cyan
@@ -78,7 +92,6 @@ Write-Host "`nStreaming response:`n" -ForegroundColor Cyan
 # Отправляем запрос с потоковой передачей
 $fullResponse = ""
 $allChoices = @{}
-$responseChoices = @()
 
 try {
     $webRequest = [System.Net.HttpWebRequest]::Create("http://127.0.0.1:8080/v1/chat/completions")
@@ -137,8 +150,6 @@ try {
                         $allChoices[$choiceIndex].finish_reason = $choice.finish_reason
                     }
                 }
-                
-                $fullResponse += $jsonData + "`n"
             } catch {
                 Write-Host "Error parsing chunk: $_" -ForegroundColor DarkYellow
             }
@@ -172,15 +183,6 @@ foreach ($choiceData in $allChoices.Values | Sort-Object index) {
     $replies += "--- Response $($choiceData.index + 1) ---"
     $replies += $choiceData.content
     $replies += ""
-    
-    $responseChoices += @{
-        index = $choiceData.index
-        message = @{
-            role = "assistant"
-            content = $choiceData.content
-        }
-        finish_reason = $choiceData.finish_reason
-    }
 }
 
 # Сохраняем в replies.txt
